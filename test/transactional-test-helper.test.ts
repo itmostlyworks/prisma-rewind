@@ -14,6 +14,15 @@ type FakeTransaction = {
 };
 
 type FakeClient = FakeTransaction & {
+  readonly enums: { readonly Status: { readonly ACTIVE: 'ACTIVE' } };
+  readonly nativeEnums: { readonly Priority: readonly ['low', 'high'] };
+  readonly raw: {
+    readonly prefix: string;
+    sql(this: FakeClient['raw'], value: string): string;
+  };
+  connect(): Promise<{ readonly connected: true }>;
+  close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
   transaction<TResult>(
     callback: (transaction: FakeTransaction) => PromiseLike<TResult>,
   ): Promise<TResult>;
@@ -21,28 +30,54 @@ type FakeClient = FakeTransaction & {
 
 function createFakeClient() {
   const committed: RecordRow[] = [];
+  const lifecycleCalls: string[] = [];
+  let originalQueryCalls = 0;
   let nextId = 1;
 
-  const collectionFor = (rows: RecordRow[]): FakeTransaction['orm']['Record'] => ({
+  const collectionFor = (
+    rows: RecordRow[],
+    original: boolean,
+  ): FakeTransaction['orm']['Record'] => ({
     async create({ label }) {
+      if (original) originalQueryCalls += 1;
       const row = { id: nextId++, label };
       rows.push(row);
       return row;
     },
     async all() {
+      if (original) originalQueryCalls += 1;
       return [...rows];
     },
     builder() {
+      if (original) originalQueryCalls += 1;
       return { all: async () => [...rows] };
     },
   });
 
   const client: FakeClient = {
-    orm: { Record: collectionFor(committed) },
+    orm: { Record: collectionFor(committed, true) },
+    enums: { Status: { ACTIVE: 'ACTIVE' } },
+    nativeEnums: { Priority: ['low', 'high'] },
+    raw: {
+      prefix: 'raw',
+      sql(value) {
+        return `${this.prefix}:${value}`;
+      },
+    },
+    async connect() {
+      lifecycleCalls.push('connect');
+      return { connected: true } as const;
+    },
+    async close() {
+      lifecycleCalls.push('close');
+    },
+    async [Symbol.asyncDispose]() {
+      lifecycleCalls.push('asyncDispose');
+    },
     async transaction(callback) {
       const transactionalRows = structuredClone(committed);
       const transaction: FakeTransaction = {
-        orm: { Record: collectionFor(transactionalRows) },
+        orm: { Record: collectionFor(transactionalRows, false) },
       };
       const result = await callback(transaction);
       committed.splice(0, committed.length, ...transactionalRows);
@@ -50,7 +85,12 @@ function createFakeClient() {
     },
   };
 
-  return { client, committed };
+  return {
+    client,
+    committed,
+    lifecycleCalls,
+    originalQueryCalls: () => originalQueryCalls,
+  };
 }
 
 describe('createTransactionalTestHelper', () => {
@@ -92,6 +132,68 @@ describe('createTransactionalTestHelper', () => {
       message: expect.stringContaining('another transaction is active'),
     });
     await helper.rollbackCurrentTransaction();
+  });
+
+  it('exposes supported static utilities with their result and calling context', async () => {
+    const { client } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+
+    expect(helper.client.raw.sql('fragment')).toBe('raw:fragment');
+    expect(helper.client.raw).toBe(client.raw);
+    expect(helper.client.enums).toBe(client.enums);
+    expect(helper.client.nativeEnums).toBe(client.nativeEnums);
+
+    await helper.startNewTransaction();
+    expect(helper.client.raw.sql('inside')).toBe('raw:inside');
+    await helper.rollbackCurrentTransaction();
+  });
+
+  it('delegates lifecycle operations only when no test transaction is active', async () => {
+    const { client, lifecycleCalls } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+
+    await expect(helper.client.connect()).resolves.toBeUndefined();
+    await helper.startNewTransaction();
+
+    expect(() => helper.client.close()).toThrowError(
+      expect.objectContaining<Partial<TransactionalTestError>>({
+        code: 'LIFECYCLE_OPERATION_DURING_TRANSACTION',
+        message: expect.stringContaining('Roll it back first'),
+      }),
+    );
+    expect(() => helper.client[Symbol.asyncDispose]()).toThrowError(
+      expect.objectContaining({ code: 'LIFECYCLE_OPERATION_DURING_TRANSACTION' }),
+    );
+
+    await helper.rollbackCurrentTransaction();
+    await helper.client.close();
+    await helper.client[Symbol.asyncDispose]();
+    expect(lifecycleCalls).toEqual(['connect', 'close', 'asyncDispose']);
+  });
+
+  it('never falls back to the original client for queries during a transaction', async () => {
+    const { client, originalQueryCalls } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+
+    await helper.startNewTransaction();
+    await helper.client.orm.Record.create({ label: 'transaction only' });
+    expect(await helper.client.orm.Record.all()).toHaveLength(1);
+    expect(originalQueryCalls()).toBe(0);
+    await helper.rollbackCurrentTransaction();
+  });
+
+  it('keeps queries isolated after utility and lifecycle interactions', async () => {
+    const { client, committed } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+
+    await helper.client.connect();
+    expect(helper.client.raw.sql('before query')).toBe('raw:before query');
+    await helper.startNewTransaction();
+    await helper.client.orm.Record.create({ label: 'temporary' });
+    expect(helper.client.enums.Status.ACTIVE).toBe('ACTIVE');
+    await helper.rollbackCurrentTransaction();
+
+    expect(committed).toEqual([]);
   });
 
   it('prevents a builder captured from a transaction from being used after rollback', async () => {

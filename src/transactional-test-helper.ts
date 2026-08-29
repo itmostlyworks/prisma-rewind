@@ -9,7 +9,8 @@ export type TransactionalTestErrorCode =
   | 'TRANSACTION_ALREADY_ACTIVE'
   | 'NO_TRANSACTION_TO_ROLLBACK'
   | 'TRANSACTION_START_FAILED'
-  | 'TRANSACTION_ENDED_UNEXPECTEDLY';
+  | 'TRANSACTION_ENDED_UNEXPECTEDLY'
+  | 'LIFECYCLE_OPERATION_DURING_TRANSACTION';
 
 export class TransactionalTestError extends Error {
   readonly code: TransactionalTestErrorCode;
@@ -64,6 +65,13 @@ function deferred<T>(): Deferred<T> {
 }
 
 const ROLLBACK_SIGNAL = Symbol('prisma-transactional-testing.rollback');
+
+const STATIC_CLIENT_PROPERTIES = new Set<PropertyKey>(['raw', 'enums', 'nativeEnums']);
+const LIFECYCLE_CLIENT_PROPERTIES = new Set<PropertyKey>([
+  'connect',
+  'close',
+  Symbol.asyncDispose,
+]);
 
 type Session<TTransaction> = {
   phase: 'starting' | 'active' | 'rolling-back';
@@ -151,9 +159,41 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
     };
   };
 
+  const originalClientProperty = (property: PropertyKey): unknown => {
+    const member = Reflect.get(originalClient, property, originalClient);
+    if (typeof member !== 'function') return member;
+
+    return (...args: unknown[]) => Reflect.apply(member, originalClient, args);
+  };
+
+  const lifecycleClientProperty = (property: PropertyKey): unknown => {
+    const member = Reflect.get(originalClient, property, originalClient);
+    if (typeof member !== 'function') return member;
+
+    return (...args: unknown[]) => {
+      if (currentSession !== undefined) {
+        throw new TransactionalTestError(
+          'LIFECYCLE_OPERATION_DURING_TRANSACTION',
+          `Cannot call Prisma client lifecycle operation ${String(property)} while a test transaction is active. Roll it back first.`,
+        );
+      }
+
+      const result = Reflect.apply(member, originalClient, args);
+      if (property === 'connect') {
+        return Promise.resolve(result).then(() => undefined);
+      }
+      return result;
+    };
+  };
+
   const makePathProxy = (path: readonly PropertyKey[]): unknown =>
     new Proxy(() => undefined, {
       get(_target, property) {
+        if (path.length === 0) {
+          if (STATIC_CLIENT_PROPERTIES.has(property)) return originalClientProperty(property);
+          if (LIFECYCLE_CLIENT_PROPERTIES.has(property)) return lifecycleClientProperty(property);
+        }
+
         return makePathProxy([...path, property]);
       },
       apply(_target, _thisArgument, argumentsList) {

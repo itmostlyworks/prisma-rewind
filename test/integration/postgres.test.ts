@@ -78,6 +78,31 @@ describeWithDatabase('PostgreSQL transaction isolation', () => {
     ]);
   });
 
+  it('keeps utilities available, blocks lifecycle conflicts, and preserves rollback isolation', async () => {
+    const original = newClient();
+    const helper = createTransactionalTestHelper(original);
+
+    expect(helper.client.enums).toBe(original.enums);
+    expect(helper.client.nativeEnums).toBe(original.nativeEnums);
+    expect(helper.client.raw.sql`SELECT 1`).toBeDefined();
+
+    await helper.startNewTransaction();
+    try {
+      expect(helper.client.raw.sql`SELECT 2`).toBeDefined();
+      expect(() => helper.client.close()).toThrowError(
+        expect.objectContaining({ code: 'LIFECYCLE_OPERATION_DURING_TRANSACTION' }),
+      );
+      await helper.client.orm.public!.Record.create({ label: 'after utilities' });
+    } finally {
+      await helper.rollbackCurrentTransaction();
+    }
+
+    expect((await setupPool.query(`SELECT count(*)::int AS count FROM ${tableName}`)).rows).toEqual([
+      { count: 0 },
+    ]);
+    await helper.client.close();
+  });
+
   it('keeps concurrently active helpers separate and rolls both back', async () => {
     const first = createTransactionalTestHelper(newClient());
     const second = createTransactionalTestHelper(newClient());

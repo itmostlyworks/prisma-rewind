@@ -27,6 +27,14 @@ Database operations through `client` require an active test transaction. Startin
 second transaction on the same helper also fails. Use a separate Prisma client and
 helper for each concurrently active test transaction.
 
+The proxy exposes Prisma's non-query `raw`, `enums`, and `nativeEnums` utilities
+without requiring a transaction. Client lifecycle methods (`connect`, `close`, and
+async disposal) delegate to the original client when no test transaction exists and
+fail clearly while one is active. The proxied `connect()` resolves to `undefined`
+instead of exposing Prisma's query-capable runtime. Unknown operations remain
+transaction-bound so a query-capable API can never silently fall back to the original
+client.
+
 ## Development
 
 ```sh
