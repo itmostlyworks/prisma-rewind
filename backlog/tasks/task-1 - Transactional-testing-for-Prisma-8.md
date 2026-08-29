@@ -1,10 +1,10 @@
 ---
 id: TASK-1
 title: Transactional testing for Prisma 8
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-29 14:41'
-updated_date: '2026-08-29 14:49'
+updated_date: '2026-08-29 21:01'
 labels: []
 dependencies: []
 ---
@@ -72,3 +72,33 @@ Prisma 8 introduces a new runtime and transaction API that is incompatible with 
 - Error classes and exact error messages.
 - Test-runner integrations.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+## QA
+
+Verdict: pass
+
+### Checked
+- Full assembled suite against local PostgreSQL: 25 passed (18 unit, 7 integration).
+- Stable proxy identity, sequential root transactions, separate concurrent helpers, lifecycle guards, and rollback isolation.
+- Successful, failed, recursive, overlapping, detached, and root-rollback nested transaction behavior.
+- Raw transaction-control statements are blocked at root and nested execution paths, including interpolated/lowered plans, comments, quoted text, and carriage-return line endings.
+- Unexpected root failures and synchronous startup failures surface their original cause and leave helper state reusable.
+- TypeScript typecheck, ESLint, production build, and diff whitespace checks passed.
+- Focused assembled-diff and security reviews completed; all concrete findings were addressed.
+
+### Expected release condition
+- Stable minimum/latest Prisma 8 compatibility remains intentionally pending because npm currently publishes only `@prisma/orm-postgres@8.0.0-rc.8`. The package documents the RC pin and the CI workflow records the stable matrix update required once Prisma 8 stable exists.
+
+## Settlement
+
+### Fixed now
+- Prevented raw transaction-control SQL from escaping root rollback or colliding with nested savepoints.
+- Preserved unexpected root transaction failures for cleanup callers and made failed helper state reusable.
+- Added real PostgreSQL regression coverage and documented transaction-control behavior.
+
+### Friction triage
+- No additional drafts or follow-up fixes were identified beyond the expected stable Prisma 8 compatibility condition.
+<!-- SECTION:NOTES:END -->

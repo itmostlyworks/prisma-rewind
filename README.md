@@ -38,7 +38,9 @@ async disposal) delegate to the original client when no test transaction exists 
 fail clearly while one is active. The proxied `connect()` resolves to `undefined`
 instead of exposing Prisma's query-capable runtime. Unknown operations remain
 transaction-bound so a query-capable API can never silently fall back to the original
-client.
+client. Raw transaction-control statements such as `COMMIT`, `ROLLBACK`, and `SAVEPOINT`
+are rejected when executed through the proxy because they could escape the helper's root
+rollback or interfere with nested savepoints.
 
 ## Development
 

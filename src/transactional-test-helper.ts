@@ -12,7 +12,8 @@ export type TransactionalTestErrorCode =
   | 'NO_TRANSACTION_TO_ROLLBACK'
   | 'TRANSACTION_START_FAILED'
   | 'TRANSACTION_ENDED_UNEXPECTEDLY'
-  | 'LIFECYCLE_OPERATION_DURING_TRANSACTION';
+  | 'LIFECYCLE_OPERATION_DURING_TRANSACTION'
+  | 'UNSAFE_TRANSACTION_CONTROL';
 
 export class TransactionalTestError extends Error {
   readonly code: TransactionalTestErrorCode;
@@ -76,11 +77,12 @@ const LIFECYCLE_CLIENT_PROPERTIES = new Set<PropertyKey>([
 ]);
 
 type Session<TTransaction> = {
-  phase: 'starting' | 'active' | 'rolling-back';
+  phase: 'starting' | 'active' | 'rolling-back' | 'failed';
   transaction?: TTransaction;
   readonly activated: Deferred<void>;
   readonly rollbackRequested: Deferred<void>;
   completion?: Promise<void>;
+  failure?: TransactionalTestError;
 };
 
 type RawStatementTag = (
@@ -101,6 +103,131 @@ type NestedTransactionScope = {
 
 function isObjectLike(value: unknown): value is object {
   return (typeof value === 'object' && value !== null) || typeof value === 'function';
+}
+
+const UNSAFE_TRANSACTION_COMMANDS = new Set([
+  'ABORT',
+  'BEGIN',
+  'COMMIT',
+  'END',
+  'RELEASE',
+  'ROLLBACK',
+  'SAVEPOINT',
+]);
+
+function executableSql(plan: unknown): readonly string[] {
+  if (!isObjectLike(plan)) return [];
+  const statements: string[] = [];
+  const ast = Reflect.get(plan, 'ast', plan);
+  if (isObjectLike(ast) && Reflect.get(ast, 'kind', ast) === 'raw-query') {
+    const parts = Reflect.get(ast, 'parts', ast);
+    if (Array.isArray(parts)) {
+      statements.push(parts.map((part) => (typeof part === 'string' ? part : ' ? ')).join(''));
+    }
+  }
+  const loweredSql = Reflect.get(plan, 'sql', plan);
+  if (typeof loweredSql === 'string') statements.push(loweredSql);
+  return statements;
+}
+
+function sqlStatementStarts(sql: string): string[][] {
+  const statements: string[][] = [[]];
+  let index = 0;
+
+  const current = () => statements.at(-1)!;
+  while (index < sql.length) {
+    const character = sql[index]!;
+
+    if (/\s/u.test(character)) {
+      index += 1;
+      continue;
+    }
+    if (character === ';') {
+      if (current().length > 0) statements.push([]);
+      index += 1;
+      continue;
+    }
+    if (sql.startsWith('--', index)) {
+      const lineFeed = sql.indexOf('\n', index + 2);
+      const carriageReturn = sql.indexOf('\r', index + 2);
+      const endings = [lineFeed, carriageReturn].filter((ending) => ending !== -1);
+      if (endings.length === 0) break;
+      index = Math.min(...endings) + 1;
+      continue;
+    }
+    if (sql.startsWith('/*', index)) {
+      let depth = 1;
+      index += 2;
+      while (index < sql.length && depth > 0) {
+        if (sql.startsWith('/*', index)) {
+          depth += 1;
+          index += 2;
+        } else if (sql.startsWith('*/', index)) {
+          depth -= 1;
+          index += 2;
+        } else {
+          index += 1;
+        }
+      }
+      continue;
+    }
+    const escapeString = (character === 'E' || character === 'e') && sql[index + 1] === "'";
+    if (escapeString || character === "'" || character === '"') {
+      const quote = escapeString ? "'" : character;
+      index += escapeString ? 2 : 1;
+      while (index < sql.length) {
+        if (escapeString && sql[index] === '\\') {
+          index += 2;
+          continue;
+        }
+        if (sql[index] === quote) {
+          if (sql[index + 1] === quote) {
+            index += 2;
+            continue;
+          }
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+    if (character === '$') {
+      const delimiter = sql.slice(index).match(/^\$[A-Za-z_][A-Za-z0-9_]*\$|^\$\$/u)?.[0];
+      if (delimiter !== undefined) {
+        const end = sql.indexOf(delimiter, index + delimiter.length);
+        index = end === -1 ? sql.length : end + delimiter.length;
+        continue;
+      }
+    }
+
+    const word = sql.slice(index).match(/^[A-Za-z_][A-Za-z0-9_$]*/u)?.[0];
+    if (word !== undefined) {
+      if (current().length < 2) current().push(word.toUpperCase());
+      index += word.length;
+      continue;
+    }
+    index += 1;
+  }
+
+  return statements.filter((statement) => statement.length > 0);
+}
+
+function assertNoTransactionControl(plan: unknown): void {
+  // Interpolated values cannot add SQL syntax, so placeholders safely separate raw parts.
+  const statements = executableSql(plan).flatMap(sqlStatementStarts);
+  const unsafe = statements.find(
+    ([first, second]) =>
+      (first !== undefined && UNSAFE_TRANSACTION_COMMANDS.has(first)) ||
+      (first === 'START' && second === 'TRANSACTION') ||
+      (first === 'PREPARE' && second === 'TRANSACTION'),
+  );
+  if (unsafe !== undefined) {
+    throw new TransactionalTestError(
+      'UNSAFE_TRANSACTION_CONTROL',
+      `Cannot execute ${unsafe.join(' ')} through a transactional test client because transaction-control SQL can escape rollback isolation.`,
+    );
+  }
 }
 
 /**
@@ -167,6 +294,9 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
 
         return (...args: unknown[]) => {
           assertValueIsUsable();
+          if (property === 'execute' || property === 'query') {
+            assertNoTransactionControl(args[0]);
+          }
           return wrapTransactionValue(
             Reflect.apply(member, target, args),
             session,
@@ -242,6 +372,10 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
       },
       apply(_target, _thisArgument, argumentsList) {
         assertNestedScopeOwnsSavepoint();
+        const operation = path.at(-1);
+        if (operation === 'execute' || operation === 'query') {
+          assertNoTransactionControl(argumentsList[0]);
+        }
         const session = currentSession;
         const { receiver, member } = resolvePath(path);
         if (typeof member !== 'function') {
@@ -387,7 +521,6 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
         'Prisma failed to start the test transaction.',
         { cause },
       );
-      session.activated.reject(error);
       currentSession = undefined;
       throw error;
     }
@@ -400,20 +533,32 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
         );
       })
       .catch((cause: unknown) => {
-        if (cause !== ROLLBACK_SIGNAL) {
-          throw new TransactionalTestError(
-            session.activated.settled()
-              ? 'TRANSACTION_ENDED_UNEXPECTEDLY'
-              : 'TRANSACTION_START_FAILED',
-            session.activated.settled()
-              ? 'The Prisma test transaction ended unexpectedly.'
-              : 'Prisma failed to start the test transaction.',
-            { cause },
-          );
+        if (cause === ROLLBACK_SIGNAL) return;
+
+        const transactionWasActivated = session.activated.settled();
+        const error =
+          cause instanceof TransactionalTestError &&
+          cause.code === 'TRANSACTION_ENDED_UNEXPECTEDLY'
+            ? cause
+            : new TransactionalTestError(
+                transactionWasActivated
+                  ? 'TRANSACTION_ENDED_UNEXPECTEDLY'
+                  : 'TRANSACTION_START_FAILED',
+                transactionWasActivated
+                  ? 'The Prisma test transaction ended unexpectedly.'
+                  : 'Prisma failed to start the test transaction.',
+                { cause },
+              );
+        if (transactionWasActivated) {
+          session.phase = 'failed';
+          session.failure = error;
         }
+        throw error;
       })
       .finally(() => {
-        if (currentSession === session) currentSession = undefined;
+        if (currentSession === session && session.phase !== 'failed') {
+          currentSession = undefined;
+        }
       });
 
     void session.completion.catch((error: unknown) => {
@@ -425,6 +570,10 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
 
   const rollbackCurrentTransaction = async (): Promise<void> => {
     const session = currentSession;
+    if (session?.phase === 'failed' && session.failure !== undefined) {
+      currentSession = undefined;
+      throw session.failure;
+    }
     if (session?.phase !== 'active' || session.completion === undefined) {
       throw new TransactionalTestError(
         'NO_TRANSACTION_TO_ROLLBACK',
@@ -440,7 +589,11 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
 
     session.phase = 'rolling-back';
     session.rollbackRequested.resolve(undefined);
-    await session.completion;
+    try {
+      await session.completion;
+    } finally {
+      if (currentSession === session) currentSession = undefined;
+    }
   };
 
   return { client, startNewTransaction, rollbackCurrentTransaction };

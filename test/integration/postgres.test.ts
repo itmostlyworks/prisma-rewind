@@ -103,6 +103,36 @@ describeWithDatabase('PostgreSQL transaction isolation', () => {
     await helper.client.close();
   });
 
+  it('rejects raw transaction-control SQL before it can escape root rollback', async () => {
+    const helper = createTransactionalTestHelper(newClient());
+    const transactionClient = helper.client as typeof helper.client & {
+      execute(plan: unknown): PromiseLike<unknown>;
+    };
+    const commitPlan = helper.client.raw.sql`SELECT 1; /* escape */ COMMIT`
+      .affectedCount()
+      .build();
+    const carriageReturnCommitPlan = helper.client.raw.sql`-- comment\rCOMMIT`
+      .affectedCount()
+      .build();
+
+    await helper.startNewTransaction();
+    try {
+      await helper.client.orm.public!.Record.create({ label: 'still isolated' });
+      expect(() => transactionClient.execute(commitPlan)).toThrowError(
+        expect.objectContaining({ code: 'UNSAFE_TRANSACTION_CONTROL' }),
+      );
+      expect(() => transactionClient.execute(carriageReturnCommitPlan)).toThrowError(
+        expect.objectContaining({ code: 'UNSAFE_TRANSACTION_CONTROL' }),
+      );
+    } finally {
+      await helper.rollbackCurrentTransaction();
+    }
+
+    expect((await setupPool.query(`SELECT count(*)::int AS count FROM ${tableName}`)).rows).toEqual([
+      { count: 0 },
+    ]);
+  });
+
   it('keeps successful nested writes visible until the root rollback', async () => {
     const helper = createTransactionalTestHelper(newClient());
 

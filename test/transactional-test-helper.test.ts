@@ -3,7 +3,11 @@ import { createTransactionalTestHelper } from '../src/index.js';
 import type { TransactionalTestError } from '../src/index.js';
 
 type RecordRow = { id: number; label: string };
-type FakeStatementPlan = { readonly statement: string };
+type FakeStatementPlan = {
+  readonly statement: string;
+  readonly ast: { readonly kind: 'raw-query'; readonly parts: readonly unknown[] };
+  readonly sql?: string;
+};
 type FakeDataSurface = {
   orm: {
     Record: {
@@ -41,6 +45,7 @@ function createFakeClient() {
   const lifecycleCalls: string[] = [];
   let originalQueryCalls = 0;
   let nextId = 1;
+  let failCurrentTransaction: ((cause: unknown) => void) | undefined;
 
   const collectionFor = (
     rows: RecordRow[],
@@ -72,7 +77,9 @@ function createFakeClient() {
         if (typeof value === 'string') return `${this.prefix}:${value}`;
         const statement = value.join('');
         return {
-          affectedCount: () => ({ build: () => ({ statement }) }),
+          affectedCount: () => ({
+            build: () => ({ statement, ast: { kind: 'raw-query', parts: [statement] } }),
+          }),
         };
       },
     },
@@ -105,7 +112,10 @@ function createFakeClient() {
         },
         orm: { Record: collectionFor(transactionalRows, false) },
       };
-      const result = await callback(transaction);
+      const forcedFailure = new Promise<never>((_resolve, reject) => {
+        failCurrentTransaction = reject;
+      });
+      const result = await Promise.race([callback(transaction), forcedFailure]);
       committed.splice(0, committed.length, ...transactionalRows);
       return result;
     },
@@ -116,6 +126,10 @@ function createFakeClient() {
     committed,
     lifecycleCalls,
     originalQueryCalls: () => originalQueryCalls,
+    failTransaction(cause: unknown) {
+      if (failCurrentTransaction === undefined) throw new Error('No transaction is active.');
+      failCurrentTransaction(cause);
+    },
   };
 }
 
@@ -195,6 +209,82 @@ describe('createTransactionalTestHelper', () => {
     await helper.client.close();
     await helper.client[Symbol.asyncDispose]();
     expect(lifecycleCalls).toEqual(['connect', 'close', 'asyncDispose']);
+  });
+
+  it('blocks raw transaction-control SQL without rejecting harmless SQL text', async () => {
+    const { client } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+    const execute = (helper.client as unknown as FakeTransaction).execute;
+    const plan = (sql: TemplateStringsArray) =>
+      helper.client.raw.sql(sql) as { affectedCount(): { build(): FakeStatementPlan } };
+    const interpolatedCommitPlan: FakeStatementPlan = {
+      statement: 'SELECT $1; COMMIT',
+      ast: { kind: 'raw-query', parts: ['SELECT ', { param: 0 }, '; COMMIT'] },
+    };
+
+    await helper.startNewTransaction();
+    await expect(
+      execute(plan`SELECT 'COMMIT'`.affectedCount().build()),
+    ).rejects.toThrow('Unknown fake transaction statement');
+    expect(() => execute(plan`SELECT 1; /* escape */ COMMIT`.affectedCount().build())).toThrowError(
+      expect.objectContaining<Partial<TransactionalTestError>>({
+        code: 'UNSAFE_TRANSACTION_CONTROL',
+        message: expect.stringContaining('rollback isolation'),
+      }),
+    );
+    expect(() => execute(plan`ROLLBACK TO SAVEPOINT other`.affectedCount().build())).toThrowError(
+      expect.objectContaining({ code: 'UNSAFE_TRANSACTION_CONTROL' }),
+    );
+    expect(() => execute(interpolatedCommitPlan)).toThrowError(
+      expect.objectContaining({ code: 'UNSAFE_TRANSACTION_CONTROL' }),
+    );
+    expect(() => execute({ ...interpolatedCommitPlan, sql: 'COMMIT' })).toThrowError(
+      expect.objectContaining({ code: 'UNSAFE_TRANSACTION_CONTROL' }),
+    );
+    expect(() => execute(plan`-- comment\rCOMMIT`.affectedCount().build())).toThrowError(
+      expect.objectContaining({ code: 'UNSAFE_TRANSACTION_CONTROL' }),
+    );
+    await expect(
+      execute(plan`SELECT E'not over \\'; COMMIT is still text'`.affectedCount().build()),
+    ).rejects.toThrow('Unknown fake transaction statement');
+    await helper.client.transaction(async (transaction) => {
+      expect(() => transaction.execute(plan`COMMIT`.affectedCount().build())).toThrowError(
+        expect.objectContaining({ code: 'UNSAFE_TRANSACTION_CONTROL' }),
+      );
+    });
+    await helper.rollbackCurrentTransaction();
+  });
+
+  it('surfaces an unexpected root failure when rollback is requested', async () => {
+    const fake = createFakeClient();
+    const helper = createTransactionalTestHelper(fake.client);
+
+    await helper.startNewTransaction();
+    fake.failTransaction(new Error('connection lost'));
+
+    await expect(helper.rollbackCurrentTransaction()).rejects.toMatchObject({
+      code: 'TRANSACTION_ENDED_UNEXPECTEDLY',
+      cause: expect.objectContaining({ message: 'connection lost' }),
+    });
+    await expect(helper.startNewTransaction()).resolves.toBeUndefined();
+    await helper.rollbackCurrentTransaction();
+  });
+
+  it('reports synchronous root startup failures without retaining a session', async () => {
+    const fake = createFakeClient();
+    const startupFailure = new Error('synchronous startup failure');
+    fake.client.transaction = () => {
+      throw startupFailure;
+    };
+    const helper = createTransactionalTestHelper(fake.client);
+
+    await expect(helper.startNewTransaction()).rejects.toMatchObject({
+      code: 'TRANSACTION_START_FAILED',
+      cause: startupFailure,
+    });
+    await expect(helper.startNewTransaction()).rejects.toMatchObject({
+      code: 'TRANSACTION_START_FAILED',
+    });
   });
 
   it('never falls back to the original client for queries during a transaction', async () => {
