@@ -1,0 +1,39 @@
+{
+  "name": "prisma-transactional-testing",
+  "version": "0.0.0",
+  "description": "Framework-agnostic transactional test isolation for Prisma 8 and PostgreSQL",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:integration": "vitest run test/integration",
+    "tc": "tsc --noEmit",
+    "lint": "eslint ."
+  },
+  "peerDependencies": {
+    "@prisma/orm-postgres": ">=8.0.0 <9"
+  },
+  "devDependencies": {
+    "@prisma/orm-postgres": "8.0.0-rc.8",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.20.4",
+    "eslint": "^9.0.0",
+    "pg": "^8.22.0",
+    "typescript": "5.9.2",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
