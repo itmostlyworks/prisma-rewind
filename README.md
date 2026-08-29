@@ -24,8 +24,13 @@ try {
 ```
 
 Database operations through `client` require an active test transaction. Starting a
-second transaction on the same helper also fails. Use a separate Prisma client and
+second root transaction on the same helper also fails. Use a separate Prisma client and
 helper for each concurrently active test transaction.
+
+Application code can call `client.transaction()` while the root test transaction is
+active. Successful nested work remains visible to the outer transaction, while a thrown
+error rolls nested work back to a PostgreSQL savepoint and leaves the outer transaction
+usable. Nested work is still removed by `rollbackCurrentTransaction()`.
 
 The proxy exposes Prisma's non-query `raw`, `enums`, and `nativeEnums` utilities
 without requiring a transaction. Client lifecycle methods (`connect`, `close`, and

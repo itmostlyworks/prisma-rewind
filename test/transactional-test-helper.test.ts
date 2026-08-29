@@ -3,7 +3,8 @@ import { createTransactionalTestHelper } from '../src/index.js';
 import type { TransactionalTestError } from '../src/index.js';
 
 type RecordRow = { id: number; label: string };
-type FakeTransaction = {
+type FakeStatementPlan = { readonly statement: string };
+type FakeDataSurface = {
   orm: {
     Record: {
       create(input: { label: string }): Promise<RecordRow>;
@@ -13,12 +14,19 @@ type FakeTransaction = {
   };
 };
 
-type FakeClient = FakeTransaction & {
+type FakeTransaction = FakeDataSurface & {
+  execute(plan: FakeStatementPlan): Promise<void>;
+};
+
+type FakeClient = FakeDataSurface & {
   readonly enums: { readonly Status: { readonly ACTIVE: 'ACTIVE' } };
   readonly nativeEnums: { readonly Priority: readonly ['low', 'high'] };
   readonly raw: {
     readonly prefix: string;
-    sql(this: FakeClient['raw'], value: string): string;
+    sql(
+      this: FakeClient['raw'],
+      value: string | TemplateStringsArray,
+    ): string | { affectedCount(): { build(): FakeStatementPlan } };
   };
   connect(): Promise<{ readonly connected: true }>;
   close(): Promise<void>;
@@ -60,8 +68,12 @@ function createFakeClient() {
     nativeEnums: { Priority: ['low', 'high'] },
     raw: {
       prefix: 'raw',
-      sql(value) {
-        return `${this.prefix}:${value}`;
+      sql(value: string | TemplateStringsArray) {
+        if (typeof value === 'string') return `${this.prefix}:${value}`;
+        const statement = value.join('');
+        return {
+          affectedCount: () => ({ build: () => ({ statement }) }),
+        };
       },
     },
     async connect() {
@@ -76,7 +88,21 @@ function createFakeClient() {
     },
     async transaction(callback) {
       const transactionalRows = structuredClone(committed);
+      const savepoints: RecordRow[][] = [];
       const transaction: FakeTransaction = {
+        async execute({ statement }) {
+          if (statement.startsWith('SAVEPOINT ')) {
+            savepoints.push(structuredClone(transactionalRows));
+          } else if (statement.startsWith('ROLLBACK TO SAVEPOINT ')) {
+            const rows = savepoints.at(-1);
+            if (rows === undefined) throw new Error('No fake savepoint to roll back.');
+            transactionalRows.splice(0, transactionalRows.length, ...structuredClone(rows));
+          } else if (statement.startsWith('RELEASE SAVEPOINT ')) {
+            if (savepoints.pop() === undefined) throw new Error('No fake savepoint to release.');
+          } else {
+            throw new Error(`Unknown fake transaction statement: ${statement}`);
+          }
+        },
         orm: { Record: collectionFor(transactionalRows, false) },
       };
       const result = await callback(transaction);
@@ -207,6 +233,181 @@ describe('createTransactionalTestHelper', () => {
     expect(() => builder.all()).toThrowError(
       expect.objectContaining({ code: 'NO_ACTIVE_TRANSACTION' }),
     );
+  });
+
+  it('keeps successful nested work visible until the root transaction rolls back', async () => {
+    const { client, committed } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+
+    await helper.startNewTransaction();
+    await helper.client.orm.Record.create({ label: 'outer' });
+    await helper.client.transaction(async (transaction) => {
+      await transaction.orm.Record.create({ label: 'nested' });
+      await expect(helper.startNewTransaction()).rejects.toMatchObject({
+        code: 'TRANSACTION_ALREADY_ACTIVE',
+      });
+    });
+
+    expect((await helper.client.orm.Record.all()).map((row) => row.label)).toEqual([
+      'outer',
+      'nested',
+    ]);
+    await helper.rollbackCurrentTransaction();
+    expect(committed).toEqual([]);
+  });
+
+  it('rolls back failed nested work and leaves the outer transaction usable', async () => {
+    const { client, committed } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+
+    await helper.startNewTransaction();
+    await helper.client.orm.Record.create({ label: 'before' });
+    await expect(
+      helper.client.transaction(async (transaction) => {
+        await transaction.orm.Record.create({ label: 'discarded' });
+        throw new Error('nested failure');
+      }),
+    ).rejects.toThrow('nested failure');
+    await helper.client.orm.Record.create({ label: 'after' });
+
+    expect((await helper.client.orm.Record.all()).map((row) => row.label)).toEqual([
+      'before',
+      'after',
+    ]);
+    await helper.rollbackCurrentTransaction();
+    expect(committed).toEqual([]);
+  });
+
+  it('invalidates values captured from a completed nested transaction', async () => {
+    const { client } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+
+    await helper.startNewTransaction();
+    const captured: { builder?: ReturnType<FakeTransaction['orm']['Record']['builder']> } = {};
+    await helper.client.transaction(async (transaction) => {
+      captured.builder = transaction.orm.Record.builder();
+    });
+
+    expect(() => captured.builder!.all()).toThrowError(
+      expect.objectContaining({
+        message: expect.stringContaining('nested Prisma transaction'),
+      }),
+    );
+    await helper.rollbackCurrentTransaction();
+  });
+
+  it('rejects overlapping sibling nested transactions', async () => {
+    const { client } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+    let signalEntered!: () => void;
+    let releaseFirst!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    const waitForRelease = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    await helper.startNewTransaction();
+    const first = helper.client.transaction(async () => {
+      signalEntered();
+      await waitForRelease;
+    });
+    await entered;
+
+    await expect(helper.client.transaction(async () => undefined)).rejects.toMatchObject({
+      code: 'TRANSACTION_ALREADY_ACTIVE',
+      message: expect.stringContaining('overlap sibling nested transactions'),
+    });
+    releaseFirst();
+    await first;
+    await helper.rollbackCurrentTransaction();
+  });
+
+  it('rejects root rollback until the active nested transaction settles', async () => {
+    const { client } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+    let signalEntered!: () => void;
+    let releaseNested!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    const waitForRelease = new Promise<void>((resolve) => {
+      releaseNested = resolve;
+    });
+
+    await helper.startNewTransaction();
+    const nested = helper.client.transaction(async () => {
+      signalEntered();
+      await waitForRelease;
+    });
+    await entered;
+
+    await expect(helper.rollbackCurrentTransaction()).rejects.toMatchObject({
+      code: 'TRANSACTION_ALREADY_ACTIVE',
+      message: expect.stringContaining('nested transaction is active'),
+    });
+    releaseNested();
+    await nested;
+    await expect(helper.rollbackCurrentTransaction()).resolves.toBeUndefined();
+  });
+
+  it('rejects outer work and cleans up when a child transaction is not awaited', async () => {
+    const { client } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+    let childResult: Promise<unknown> | undefined;
+
+    await helper.startNewTransaction();
+    await expect(
+      helper.client.transaction(async (outerNested) => {
+        childResult = helper.client
+          .transaction(async (innerNested) => {
+            await innerNested.orm.Record.create({ label: 'detached child' });
+          })
+          .catch((error: unknown) => error);
+
+        expect(() => outerNested.orm.Record.all()).toThrowError(
+          expect.objectContaining({
+            code: 'TRANSACTION_ALREADY_ACTIVE',
+            message: expect.stringContaining('Await the nested transaction'),
+          }),
+        );
+      }),
+    ).rejects.toMatchObject({
+      code: 'TRANSACTION_ALREADY_ACTIVE',
+      message: expect.stringContaining('ended before its child transaction'),
+    });
+    await childResult;
+
+    await helper.client.orm.Record.create({ label: 'root remains usable' });
+    expect((await helper.client.orm.Record.all()).map((row) => row.label)).toEqual([
+      'root remains usable',
+    ]);
+    await helper.rollbackCurrentTransaction();
+  });
+
+  it('preserves savepoint boundaries across multiple nested levels', async () => {
+    const { client, committed } = createFakeClient();
+    const helper = createTransactionalTestHelper(client);
+
+    await helper.startNewTransaction();
+    await helper.client.transaction(async (outerNested) => {
+      await outerNested.orm.Record.create({ label: 'level one' });
+      await expect(
+        helper.client.transaction(async (innerNested) => {
+          await innerNested.orm.Record.create({ label: 'level two discarded' });
+          throw new Error('inner failure');
+        }),
+      ).rejects.toThrow('inner failure');
+      await outerNested.orm.Record.create({ label: 'level one continued' });
+    });
+
+    expect((await helper.client.orm.Record.all()).map((row) => row.label)).toEqual([
+      'level one',
+      'level one continued',
+    ]);
+    await helper.rollbackCurrentTransaction();
+    expect(committed).toEqual([]);
   });
 
   it('isolates concurrent transactions owned by separate helpers', async () => {

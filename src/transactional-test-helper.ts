@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+
 export interface TransactionClient<TTransaction = unknown> {
   transaction<TResult>(
     callback: (transaction: TTransaction) => PromiseLike<TResult>,
@@ -81,6 +83,22 @@ type Session<TTransaction> = {
   completion?: Promise<void>;
 };
 
+type RawStatementTag = (
+  strings: TemplateStringsArray,
+  ...values: unknown[]
+) => {
+  affectedCount(): { build(): unknown };
+};
+
+type TransactionExecutor = {
+  execute(plan: unknown): PromiseLike<unknown>;
+};
+
+type NestedTransactionScope = {
+  active: boolean;
+  readonly completion: Deferred<void>;
+};
+
 function isObjectLike(value: unknown): value is object {
   return (typeof value === 'object' && value !== null) || typeof value === 'function';
 }
@@ -94,6 +112,8 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
 ): TransactionalTestHelper<TClient> {
   type TTransaction = TransactionOf<TClient>;
   let currentSession: Session<TTransaction> | undefined;
+  const nestedTransactionContext = new AsyncLocalStorage<NestedTransactionScope>();
+  const nestedTransactionStack: NestedTransactionScope[] = [];
 
   const noActiveTransaction = () =>
     new TransactionalTestError(
@@ -115,27 +135,51 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
     }
   };
 
-  const wrapTransactionValue = <T>(value: T, session: Session<TTransaction>): T => {
+  const assertNestedScopeOwnsSavepoint = (): void => {
+    const openScope = nestedTransactionStack.at(-1);
+    if (openScope !== undefined && nestedTransactionContext.getStore() !== openScope) {
+      throw new TransactionalTestError(
+        'TRANSACTION_ALREADY_ACTIVE',
+        'Cannot execute Prisma operations from an outer scope while a nested transaction is still active. Await the nested transaction first.',
+      );
+    }
+  };
+
+  const wrapTransactionValue = <T>(
+    value: T,
+    session: Session<TTransaction>,
+    assertAdditionalScope = () => undefined,
+  ): T => {
     if (!isObjectLike(value)) return value;
+
+    const assertValueIsUsable = () => {
+      assertSessionIsActive(session);
+      assertAdditionalScope();
+    };
 
     return new Proxy(value, {
       get(target, property) {
-        assertSessionIsActive(session);
+        assertValueIsUsable();
         const member = Reflect.get(target, property, target);
         if (typeof member !== 'function') {
-          return wrapTransactionValue(member, session);
+          return wrapTransactionValue(member, session, assertAdditionalScope);
         }
 
         return (...args: unknown[]) => {
-          assertSessionIsActive(session);
-          return wrapTransactionValue(Reflect.apply(member, target, args), session);
+          assertValueIsUsable();
+          return wrapTransactionValue(
+            Reflect.apply(member, target, args),
+            session,
+            assertAdditionalScope,
+          );
         };
       },
       apply(target, thisArgument, argumentsList) {
-        assertSessionIsActive(session);
+        assertValueIsUsable();
         return wrapTransactionValue(
           Reflect.apply(target as (...args: unknown[]) => unknown, thisArgument, argumentsList),
           session,
+          assertAdditionalScope,
         );
       },
     });
@@ -197,6 +241,7 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
         return makePathProxy([...path, property]);
       },
       apply(_target, _thisArgument, argumentsList) {
+        assertNestedScopeOwnsSavepoint();
         const session = currentSession;
         const { receiver, member } = resolvePath(path);
         if (typeof member !== 'function') {
@@ -207,7 +252,110 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
       },
     });
 
-  const client = makePathProxy([]) as TClient;
+  const savepointPlans = (() => {
+    const raw = Reflect.get(originalClient, 'raw', originalClient);
+    const rawSql = isObjectLike(raw) ? Reflect.get(raw, 'sql', raw) : undefined;
+    if (typeof rawSql !== 'function') return undefined;
+
+    const statement = rawSql as RawStatementTag;
+    return {
+      create: statement`SAVEPOINT prisma_transactional_testing`.affectedCount().build(),
+      rollback: statement`ROLLBACK TO SAVEPOINT prisma_transactional_testing`
+        .affectedCount()
+        .build(),
+      release: statement`RELEASE SAVEPOINT prisma_transactional_testing`
+        .affectedCount()
+        .build(),
+    };
+  })();
+
+  const runNestedTransaction = async <TResult>(
+    callback: (transaction: TTransaction) => PromiseLike<TResult>,
+  ): Promise<TResult> => {
+    const transaction = activeTransaction();
+    const session = currentSession!;
+    const parentScope = nestedTransactionContext.getStore();
+    const openScope = nestedTransactionStack.at(-1);
+
+    if (openScope !== undefined && parentScope !== openScope) {
+      throw new TransactionalTestError(
+        'TRANSACTION_ALREADY_ACTIVE',
+        'Cannot overlap sibling nested transactions on one helper. Await each nested transaction before starting another.',
+      );
+    }
+
+    const execute = isObjectLike(transaction)
+      ? Reflect.get(transaction, 'execute', transaction)
+      : undefined;
+    if (typeof execute !== 'function' || savepointPlans === undefined) {
+      throw new TypeError(
+        'The active Prisma transaction does not expose the PostgreSQL statement APIs required for nested transactions.',
+      );
+    }
+
+    const scope: NestedTransactionScope = {
+      active: true,
+      completion: deferred<void>(),
+    };
+    nestedTransactionStack.push(scope);
+    const executor = transaction as TransactionExecutor;
+
+    try {
+      await executor.execute(savepointPlans.create);
+      try {
+        const scopedTransaction = wrapTransactionValue(transaction, session, () => {
+          if (!scope.active) {
+            throw new TypeError(
+              'Cannot use a nested Prisma transaction after its callback has ended.',
+            );
+          }
+          assertNestedScopeOwnsSavepoint();
+        });
+        const result = await nestedTransactionContext.run(scope, () =>
+          callback(scopedTransaction),
+        );
+
+        let detachedChild = false;
+        while (nestedTransactionStack.at(-1) !== scope) {
+          detachedChild = true;
+          await nestedTransactionStack.at(-1)!.completion.promise;
+        }
+        if (detachedChild) {
+          throw new TransactionalTestError(
+            'TRANSACTION_ALREADY_ACTIVE',
+            'A nested transaction callback ended before its child transaction. Await every child transaction before returning.',
+          );
+        }
+
+        scope.active = false;
+        await executor.execute(savepointPlans.release);
+        return result;
+      } catch (cause) {
+        scope.active = false;
+        try {
+          await executor.execute(savepointPlans.rollback);
+          await executor.execute(savepointPlans.release);
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [cause, cleanupError],
+            'A nested Prisma transaction failed and its savepoint could not be rolled back.',
+          );
+        }
+        throw cause;
+      }
+    } finally {
+      if (nestedTransactionStack.at(-1) === scope) nestedTransactionStack.pop();
+      scope.completion.resolve(undefined);
+    }
+  };
+
+  const originalMakePathProxy = makePathProxy;
+  const client = new Proxy(originalMakePathProxy([]) as TClient, {
+    get(target, property, receiver) {
+      if (property === 'transaction') return runNestedTransaction;
+      return Reflect.get(target, property, receiver);
+    },
+  });
 
   const startNewTransaction = async (): Promise<void> => {
     if (currentSession !== undefined) {
@@ -281,6 +429,12 @@ export function createTransactionalTestHelper<TClient extends TransactionClient>
       throw new TransactionalTestError(
         'NO_TRANSACTION_TO_ROLLBACK',
         'Cannot roll back because this helper has no active test transaction.',
+      );
+    }
+    if (nestedTransactionStack.length > 0) {
+      throw new TransactionalTestError(
+        'TRANSACTION_ALREADY_ACTIVE',
+        'Cannot roll back the root test transaction while a nested transaction is active. Await the nested transaction first.',
       );
     }
 

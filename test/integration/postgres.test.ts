@@ -39,7 +39,7 @@ describeWithDatabase('PostgreSQL transaction isolation', () => {
 
   beforeAll(async () => {
     await setupPool.query(
-      `CREATE TABLE ${tableName} (id char(36) PRIMARY KEY, label text NOT NULL)`,
+      `CREATE TABLE ${tableName} (id char(36) PRIMARY KEY, label text NOT NULL UNIQUE)`,
     );
   });
 
@@ -101,6 +101,90 @@ describeWithDatabase('PostgreSQL transaction isolation', () => {
       { count: 0 },
     ]);
     await helper.client.close();
+  });
+
+  it('keeps successful nested writes visible until the root rollback', async () => {
+    const helper = createTransactionalTestHelper(newClient());
+
+    await helper.startNewTransaction();
+    try {
+      await helper.client.orm.public!.Record.create({ label: 'outer' });
+      await helper.client.transaction(async (transaction) => {
+        await transaction.orm.public!.Record.create({ label: 'nested' });
+        await expect(helper.startNewTransaction()).rejects.toMatchObject({
+          code: 'TRANSACTION_ALREADY_ACTIVE',
+        });
+      });
+
+      expect(
+        (await helper.client.orm.public!.Record.select('label').all())
+          .map((row) => row.label)
+          .sort(),
+      ).toEqual(['nested', 'outer']);
+    } finally {
+      await helper.rollbackCurrentTransaction();
+    }
+
+    expect((await setupPool.query(`SELECT count(*)::int AS count FROM ${tableName}`)).rows).toEqual([
+      { count: 0 },
+    ]);
+  });
+
+  it('rolls back a failed nested transaction and keeps the root usable', async () => {
+    const helper = createTransactionalTestHelper(newClient());
+
+    await helper.startNewTransaction();
+    try {
+      await helper.client.orm.public!.Record.create({ label: 'duplicate' });
+      await expect(
+        helper.client.transaction(async (transaction) => {
+          await transaction.orm.public!.Record.create({ label: 'duplicate' });
+        }),
+      ).rejects.toBeDefined();
+      await helper.client.orm.public!.Record.create({ label: 'after' });
+
+      expect(
+        (await helper.client.orm.public!.Record.select('label').all())
+          .map((row) => row.label)
+          .sort(),
+      ).toEqual(['after', 'duplicate']);
+    } finally {
+      await helper.rollbackCurrentTransaction();
+    }
+
+    expect((await setupPool.query(`SELECT count(*)::int AS count FROM ${tableName}`)).rows).toEqual([
+      { count: 0 },
+    ]);
+  });
+
+  it('preserves multiple nested savepoint boundaries', async () => {
+    const helper = createTransactionalTestHelper(newClient());
+
+    await helper.startNewTransaction();
+    try {
+      await helper.client.transaction(async (outerNested) => {
+        await outerNested.orm.public!.Record.create({ label: 'level one' });
+        await expect(
+          helper.client.transaction(async (innerNested) => {
+            await innerNested.orm.public!.Record.create({ label: 'level two discarded' });
+            throw new Error('inner failure');
+          }),
+        ).rejects.toThrow('inner failure');
+        await outerNested.orm.public!.Record.create({ label: 'level one continued' });
+      });
+
+      expect(
+        (await helper.client.orm.public!.Record.select('label').all())
+          .map((row) => row.label)
+          .sort(),
+      ).toEqual(['level one', 'level one continued']);
+    } finally {
+      await helper.rollbackCurrentTransaction();
+    }
+
+    expect((await setupPool.query(`SELECT count(*)::int AS count FROM ${tableName}`)).rows).toEqual([
+      { count: 0 },
+    ]);
   });
 
   it('keeps concurrently active helpers separate and rolls both back', async () => {
