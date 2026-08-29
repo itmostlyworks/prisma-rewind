@@ -3,8 +3,8 @@
 Framework-agnostic transaction isolation for PostgreSQL tests using Prisma 8.
 
 > Prisma 8 is currently available as a release candidate. Development is pinned to
-> `@prisma/orm-postgres@8.0.0-rc.8`; the package peer range targets the first stable
-> Prisma 8 release (`>=8.0.0 <9`).
+> `@prisma/orm-postgres@8.0.0-rc.8`; the package peer range supports that release
+> candidate and subsequent Prisma 8 releases (`>=8.0.0-rc.8 <9`).
 
 ## Usage
 

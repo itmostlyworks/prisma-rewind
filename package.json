@@ -20,7 +20,7 @@
     "lint": "eslint ."
   },
   "peerDependencies": {
-    "@prisma/orm-postgres": ">=8.0.0 <9"
+    "@prisma/orm-postgres": ">=8.0.0-rc.8 <9"
   },
   "devDependencies": {
     "@prisma/orm-postgres": "8.0.0-rc.8",
