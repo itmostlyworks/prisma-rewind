@@ -1,7 +1,18 @@
 {
-  "name": "prisma-rewind",
+  "name": "@mostlyworks/prisma-rewind",
   "version": "0.0.0",
   "description": "Framework-agnostic transactional test isolation for Prisma 8 and PostgreSQL",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/itmostlyworks/prisma-rewind.git"
+  },
+  "bugs": {
+    "url": "https://github.com/itmostlyworks/prisma-rewind/issues"
+  },
+  "homepage": "https://github.com/itmostlyworks/prisma-rewind#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "exports": {
     ".": {

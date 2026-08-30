@@ -1,6 +1,10 @@
-# prisma-rewind
+# @mostlyworks/prisma-rewind
 
 Framework-agnostic transaction isolation for PostgreSQL tests using Prisma 8.
+
+```sh
+npm install --save-dev @mostlyworks/prisma-rewind
+```
 
 > Prisma 8 is currently available as a release candidate. Development is pinned to
 > `@prisma/orm-postgres@8.0.0-rc.8`; the package peer range supports that release
@@ -9,7 +13,7 @@ Framework-agnostic transaction isolation for PostgreSQL tests using Prisma 8.
 ## Usage
 
 ```ts
-import { createTransactionalTestHelper } from 'prisma-rewind';
+import { createTransactionalTestHelper } from '@mostlyworks/prisma-rewind';
 import { db } from './prisma/db.js';
 
 const testDb = createTransactionalTestHelper(db);
