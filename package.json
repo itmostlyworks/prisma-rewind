@@ -1,5 +1,5 @@
 {
-  "name": "prisma-transactional-testing",
+  "name": "prisma-rewind",
   "version": "0.0.0",
   "description": "Framework-agnostic transactional test isolation for Prisma 8 and PostgreSQL",
   "type": "module",

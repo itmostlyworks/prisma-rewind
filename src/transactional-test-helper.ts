@@ -67,7 +67,7 @@ function deferred<T>(): Deferred<T> {
   };
 }
 
-const ROLLBACK_SIGNAL = Symbol('prisma-transactional-testing.rollback');
+const ROLLBACK_SIGNAL = Symbol('prisma-rewind.rollback');
 
 const STATIC_CLIENT_PROPERTIES = new Set<PropertyKey>(['raw', 'enums', 'nativeEnums']);
 const LIFECYCLE_CLIENT_PROPERTIES = new Set<PropertyKey>([

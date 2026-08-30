@@ -1,4 +1,4 @@
-# prisma-transactional-testing
+# prisma-rewind
 
 Framework-agnostic transaction isolation for PostgreSQL tests using Prisma 8.
 
@@ -9,7 +9,7 @@ Framework-agnostic transaction isolation for PostgreSQL tests using Prisma 8.
 ## Usage
 
 ```ts
-import { createTransactionalTestHelper } from 'prisma-transactional-testing';
+import { createTransactionalTestHelper } from 'prisma-rewind';
 import { db } from './prisma/db.js';
 
 const testDb = createTransactionalTestHelper(db);
